@@ -40,9 +40,47 @@ openenv import path/to/source --name my_env --output-dir ./envs --env-class MyEn
 
 ## `openenv validate`
 
+Use an explicit profile to produce the RFC 008 validation plan and shared
+report schema:
+
+```bash
+openenv validate path/to/env --profile static
+openenv validate path/to/env --profile runtime --json
+openenv validate --url http://127.0.0.1:8000 --profile runtime --json
+openenv validate path/to/env --profile full --output validation.json
+openenv validate path/to/env --profile publish --remote --output validation.json
+```
+
+`static` checks source and packaging, `runtime` adds a launched or connected
+server, and `full` records every policy criterion while marking unavailable
+remote capabilities as skipped. `publish` runs the runtime check set as a
+strict author gate: every blocking criterion must pass, so blocking skips are
+reported as incomplete and exit non-zero. Reports include typed diagnostics,
+repository-relative locations, display-only remediation, and safe evidence
+with `--verbose`.
+
+`--remote` uploads the environment revision and the initiating validator source
+to a new dedicated Hugging Face Sandbox. The HF token authorizes Sandbox
+creation but is not forwarded into the workload. The returned report uses the
+same schema and remains unofficial; it never claims Hub certification.
+Automatic local launch executes the checkout as the current user and is only
+for trusted development source. Use `--url` for a server you already isolated,
+or `--remote` to isolate source execution.
+
+This command intentionally targets the served OpenEnv spec. Shared reports
+record spec, adapter, and execution-model provenance, but `openenv validate`
+does not auto-dispatch external task-package formats. A separate spec-selected
+task workflow is tracked in [issue #898](https://github.com/huggingface/OpenEnv/issues/898).
+
 [[autodoc]] openenv.cli.commands.validate.validate
 
 ## `openenv push`
+
+Hub pushes automatically require a passing remote `publish` report. The CLI
+adds a portable copy to `.openenv/validation-report.json` in the same uploaded
+revision. This is author evidence for debugging and automation, not the richer
+independent certification report that the planned Hub validation service will
+produce.
 
 [[autodoc]] openenv.cli.commands.push.push
 

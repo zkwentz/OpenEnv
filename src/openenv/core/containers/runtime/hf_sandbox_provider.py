@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import socket
 import threading
 import time
 from contextlib import suppress
-from typing import Any
+from typing import Any, Literal
 
 import requests
 import uvicorn
@@ -27,12 +28,40 @@ from .providers import ContainerProvider
 
 
 _DEFAULT_PORT = 8000
-_SERVER_COMMAND = (
+_POOLED_SERVER_COMMAND = (
     'export SBX_PROXY_DIR="${SBX_PROXY_DIR:-$HOME/.sbx/proxy}"; '
     'mkdir -p "$SBX_PROXY_DIR"; '
-    'nohup server >"$HOME/openenv-server.log" 2>&1 &'
+    'exec server >"$HOME/openenv-server.log" 2>&1'
 )
+_DEDICATED_SERVER_COMMAND = (
+    'unset SBX_PROXY_DIR; exec server >"$HOME/openenv-server.log" 2>&1'
+)
+# Compatibility alias for callers that imported the old private constant.
+_SERVER_COMMAND = _POOLED_SERVER_COMMAND
 _MAX_WS_MESSAGE_SIZE = 100 * 1024 * 1024
+_MAX_HTTP_RESPONSE_SIZE = 100 * 1024 * 1024
+_CREDENTIAL_ENV_NAME = re.compile(
+    r"(?i)(?:^|[_-])(?:auth(?:orization)?|credentials?|password|passwd|"
+    r"private[_-]?key|secret|token|api[_-]?key|access[_-]?key(?:[_-]?id)?)"
+    r"(?:$|[_-])|(?:^|[_-])(?:jwt|pat|askpass)(?:$|[_-])"
+)
+_CREDENTIAL_ENV_ALIASES = frozenset(
+    {"PGPASSWORD", "PGPASSFILE", "MYSQL_PWD", "GIT_ASKPASS", "NETRC"}
+)
+_CREDENTIAL_ENV_VALUE = (
+    re.compile(r"(?i)\bbearer\s+\S+"),
+    re.compile(r"(?i)\b(?:hf_|sk-|github_pat_|gh[pousr]_)[A-Za-z0-9_-]{8,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s@]*:[^/\s@]+@"),
+    re.compile(
+        r"(?i)\b[a-z][a-z0-9+.-]*://[^\s#]*[?&]"
+        r"(?:auth(?:orization)?|credentials?|password|passwd|token|"
+        r"api[_-]?key|access[_-]?key|key|sig(?:nature)?|awsaccesskeyid|"
+        r"googleaccessid|x[-_]amz[-_](?:credential|security[-_]token|signature)|"
+        r"x[-_]goog[-_](?:credential|signature))=[^&#\s]+"
+    ),
+)
 _HOP_BY_HOP_HEADERS = {
     "connection",
     "content-encoding",
@@ -48,6 +77,26 @@ _HOP_BY_HOP_HEADERS = {
 }
 _POOLS: dict[tuple[str, str], Any] = {}
 _POOL_LOCK = threading.Lock()
+
+
+def credential_environment_names(env_vars: dict[str, str] | None) -> list[str]:
+    """Return names whose name or value appears to carry credentials."""
+    flagged: list[str] = []
+    for raw_name, raw_value in (env_vars or {}).items():
+        name = str(raw_name)
+        value = str(raw_value)
+        if (
+            name.upper() in _CREDENTIAL_ENV_ALIASES
+            or _CREDENTIAL_ENV_NAME.search(name)
+            or any(pattern.search(value) for pattern in _CREDENTIAL_ENV_VALUE)
+        ):
+            flagged.append(name)
+    return sorted(flagged)
+
+
+class _NoRedirectWebSocketConnect(ws_connect):
+    def process_redirect(self, exc: Exception) -> Exception | str:
+        return exc
 
 
 def _find_available_port() -> int:
@@ -79,6 +128,22 @@ def _get_sandbox_pool_cls() -> Any:
             "SandboxPool.create and Sandbox.proxy_url_for support."
         ) from exc
     return SandboxPool
+
+
+def _get_sandbox_cls() -> Any:
+    try:
+        from huggingface_hub import Sandbox
+    except ImportError as exc:
+        raise RuntimeError(
+            "Dedicated HFSandboxProvider execution requires huggingface_hub>=1.22.0. "
+            "Install it with `pip install 'openenv[hf-sandbox]'`."
+        ) from exc
+    if not hasattr(Sandbox, "create"):
+        raise RuntimeError(
+            "Dedicated HFSandboxProvider execution requires huggingface_hub>=1.22.0. "
+            "Install it with `pip install 'openenv[hf-sandbox]'`."
+        )
+    return Sandbox
 
 
 def _get_pool(image: str, flavor: str) -> Any:
@@ -133,23 +198,40 @@ class _LocalAuthProxy:
                     data=body,
                     headers=headers,
                     timeout=60.0,
-                    allow_redirects=True,
+                    allow_redirects=False,
+                    stream=True,
                 )
             except requests.RequestException:
                 return Response(
                     content=b"upstream HF job unreachable",
                     status_code=502,
                 )
-            response_headers = {
-                key: value
-                for key, value in upstream.headers.items()
-                if key.lower() not in _HOP_BY_HOP_HEADERS
-            }
-            return Response(
-                content=upstream.content,
-                status_code=upstream.status_code,
-                headers=response_headers,
-            )
+            try:
+                if 300 <= upstream.status_code < 400:
+                    return Response(
+                        content=b"upstream HF job redirects are not allowed",
+                        status_code=502,
+                    )
+                content = upstream.raw.read(
+                    _MAX_HTTP_RESPONSE_SIZE + 1, decode_content=True
+                )
+                if len(content) > _MAX_HTTP_RESPONSE_SIZE:
+                    return Response(
+                        content=b"upstream HF job response exceeded proxy limit",
+                        status_code=502,
+                    )
+                response_headers = {
+                    key: value
+                    for key, value in upstream.headers.items()
+                    if key.lower() not in _HOP_BY_HOP_HEADERS
+                }
+                return Response(
+                    content=content,
+                    status_code=upstream.status_code,
+                    headers=response_headers,
+                )
+            finally:
+                upstream.close()
 
         @app.websocket("/{path:path}")
         async def proxy_websocket(path: str, websocket: WebSocket) -> None:
@@ -202,7 +284,7 @@ class _LocalAuthProxy:
         last_error: Exception | None = None
         for _ in range(5):
             try:
-                return await ws_connect(
+                return await _NoRedirectWebSocketConnect(
                     target,
                     additional_headers=headers,
                     max_size=_MAX_WS_MESSAGE_SIZE,
@@ -243,13 +325,90 @@ class HFSandboxProvider(ContainerProvider):
         *,
         image: str,
         env_vars: dict[str, str] | None = None,
+        secrets: dict[str, str] | None = None,
         flavor: str = "cpu-basic",
+        mode: Literal["pooled", "dedicated"] = "pooled",
     ):
+        if mode not in {"pooled", "dedicated"}:
+            raise ValueError("HFSandboxProvider mode must be 'pooled' or 'dedicated'")
+        if mode == "pooled" and secrets:
+            raise ValueError("Encrypted secrets require dedicated HF sandbox mode")
         self.image = image
-        self.env_vars = env_vars
+        self._env_vars = dict(env_vars) if env_vars is not None else None
+        self._secrets = dict(secrets) if secrets is not None else None
         self.flavor = flavor
+        self._mode = mode
+        self._official_certification = False
+        self._official_image: str | None = None
+        self._official_flavor: str | None = None
+        self._official_env_vars: dict[str, str] | None = None
         self._sandbox: Any = None
+        self._server_process: Any = None
         self._proxy: _LocalAuthProxy | None = None
+
+    @property
+    def mode(self) -> Literal["pooled", "dedicated"]:
+        return self._mode
+
+    @property
+    def env_vars(self) -> dict[str, str] | None:
+        return dict(self._env_vars) if self._env_vars is not None else None
+
+    @property
+    def secrets(self) -> dict[str, str] | None:
+        return dict(self._secrets) if self._secrets is not None else None
+
+    @property
+    def isolation_mode(self) -> Literal["pooled", "dedicated", "unknown"]:
+        if self._sandbox is None:
+            return self._mode
+        try:
+            host_id = self._sandbox.host_id
+        except (AttributeError, RuntimeError):
+            return "unknown"
+        return "dedicated" if host_id is None else "pooled"
+
+    def _lock_for_official_certification(self) -> None:
+        """Freeze the settings that cross the official runner trust boundary."""
+        if self._sandbox is not None:
+            raise RuntimeError(
+                "Official certification must validate and lock the provider "
+                "before a Hugging Face sandbox is started."
+            )
+        self._official_certification = True
+        self._official_image = self.image
+        self._official_flavor = self.flavor
+        self._official_env_vars = (
+            dict(self._env_vars) if self._env_vars is not None else None
+        )
+
+    def _verify_official_runtime_isolation(self) -> None:
+        try:
+            host_id = self._sandbox.host_id
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                "Official certification could not verify dedicated isolation "
+                "for the created Hugging Face sandbox."
+            ) from exc
+        if host_id is not None:
+            raise RuntimeError(
+                "Official certification requires a dedicated Hugging Face sandbox; "
+                "the created sandbox is attached to a shared host."
+            )
+
+    def _create_sandbox(self, *, image: str, env_vars: dict[str, str] | None) -> Any:
+        if self.mode == "dedicated":
+            Sandbox = _get_sandbox_cls()
+            create_kwargs: dict[str, Any] = {
+                "image": image,
+                "flavor": self.flavor,
+                "env": env_vars,
+            }
+            if self._secrets is not None:
+                create_kwargs["secrets"] = dict(self._secrets)
+            return Sandbox.create(**create_kwargs)
+        pool = _get_pool(image, self.flavor)
+        return pool.create(env=env_vars)
 
     def start_container(
         self,
@@ -271,11 +430,37 @@ class HFSandboxProvider(ContainerProvider):
                 f"HFSandboxProvider only supports port {_DEFAULT_PORT} (got {port})."
             )
 
+        if self._official_certification:
+            if (
+                self.image != self._official_image
+                or self.flavor != self._official_flavor
+                or self.mode != "dedicated"
+                or self._env_vars != self._official_env_vars
+                or (image is not None and image != self._official_image)
+            ):
+                raise RuntimeError(
+                    "Official certification does not allow execution-setting changes "
+                    "after the provider trust check."
+                )
+            if env_vars is not None:
+                raise RuntimeError(
+                    "Official certification does not allow environment overrides "
+                    "after the provider trust check."
+                )
+            credential_names = credential_environment_names(self._env_vars)
+            if credential_names or self._secrets:
+                raise RuntimeError(
+                    "Official subject sandboxes cannot receive coordinator credentials."
+                )
+
         effective_image = self.image if image is None else image
-        effective_env = self.env_vars if env_vars is None else env_vars
-        pool = _get_pool(effective_image, self.flavor)
-        self._sandbox = pool.create(env=effective_env)
+        effective_env = self._env_vars if env_vars is None else env_vars
+        self._sandbox = self._create_sandbox(
+            image=effective_image, env_vars=effective_env
+        )
         try:
+            if self._official_certification:
+                self._verify_official_runtime_isolation()
             if not hasattr(self._sandbox, "proxy_url_for") or not hasattr(
                 self._sandbox, "proxy_headers"
             ):
@@ -283,9 +468,14 @@ class HFSandboxProvider(ContainerProvider):
                     "HFSandboxProvider requires a huggingface_hub version with "
                     "Sandbox.proxy_url_for and Sandbox.proxy_headers support."
                 )
-            self._sandbox.run(
-                _SERVER_COMMAND,
+            self._server_process = self._sandbox.run(
+                (
+                    _DEDICATED_SERVER_COMMAND
+                    if self.mode == "dedicated"
+                    else _POOLED_SERVER_COMMAND
+                ),
                 shell=True,
+                background=True,
             )
             self._proxy = _LocalAuthProxy(
                 target_url=self._sandbox.proxy_url_for(_DEFAULT_PORT, "/"),
@@ -293,25 +483,38 @@ class HFSandboxProvider(ContainerProvider):
             )
             return self._proxy.start()
         except Exception:
-            self.stop_container()
+            with suppress(Exception):
+                self.stop_container()
             raise
 
     def stop_container(self) -> None:
+        proxy_error: Exception | None = None
         if self._proxy is not None:
-            self._proxy.stop()
-            self._proxy = None
+            try:
+                self._proxy.stop()
+            except Exception as exc:
+                proxy_error = exc
+            finally:
+                self._proxy = None
         if self._sandbox is not None:
             sandbox = self._sandbox
+            sandbox.kill()
+            if getattr(sandbox, "_killed", None) is not True:
+                raise RuntimeError(
+                    "Hugging Face did not confirm termination of the sandbox; "
+                    "the provider retained its handle so cleanup can be retried."
+                )
             self._sandbox = None
-            with suppress(Exception):
-                sandbox.kill()
+            self._server_process = None
+        if proxy_error is not None:
+            raise proxy_error
 
     def wait_for_ready(self, base_url: str, timeout_s: float = 120.0) -> None:
         deadline = time.time() + timeout_s
         health_url = f"{base_url}/health"
         while time.time() < deadline:
             try:
-                response = requests.get(health_url, timeout=5.0)
+                response = requests.get(health_url, timeout=5.0, allow_redirects=False)
                 if response.status_code == 200:
                     return
             except requests.exceptions.RequestException:
